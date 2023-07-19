@@ -18,6 +18,7 @@ use crate::utils::into_iter;
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::mem::{size_of, zeroed};
+use std::ops::Range;
 use std::ptr;
 use std::time::{Duration, SystemTime};
 
@@ -27,7 +28,9 @@ use ntapi::ntexapi::{
 use winapi::ctypes::wchar_t;
 use winapi::shared::minwindef::{FALSE, TRUE};
 use winapi::shared::ntdef::{PVOID, ULONG};
-use winapi::shared::ntstatus::{STATUS_INFO_LENGTH_MISMATCH, STATUS_SUCCESS};
+use winapi::shared::ntstatus::{
+    STATUS_BUFFER_TOO_SMALL, STATUS_INFO_LENGTH_MISMATCH, STATUS_SUCCESS,
+};
 use winapi::um::minwinbase::STILL_ACTIVE;
 use winapi::um::processthreadsapi::GetExitCodeProcess;
 use winapi::um::psapi::{GetPerformanceInfo, PERFORMANCE_INFORMATION};
@@ -228,6 +231,10 @@ impl SystemExt for System {
 
         loop {
             let mut cb_needed = 0;
+            // We should never request a buffer > ULONG::max/2 size which is 2GiB
+            // Constraint: on x86 isize is used as an offset below which limits us to accessing
+            // the first 2GiB of buffer without overflow
+            assert!(buffer_size < (ULONG::MAX / 2) as usize);
             // reserve(n) ensures the Vec has capacity for n elements on top of len
             // so we should reserve buffer_size - len. len will always be zero at this point
             // this is a no-op on the first call as buffer_size == capacity
@@ -242,8 +249,16 @@ impl SystemExt for System {
                 );
 
                 if ntstatus == STATUS_SUCCESS {
+                    if cb_needed > 0 {
+                        // Trim the buffer_size that is considered initialized to the used part
+                        // if provided
+                        assert!(cb_needed as usize <= buffer_size);
+                        buffer_size = cb_needed as usize;
+                    }
                     break;
-                } else if ntstatus == STATUS_INFO_LENGTH_MISMATCH {
+                } else if ntstatus == STATUS_INFO_LENGTH_MISMATCH
+                    || ntstatus == STATUS_BUFFER_TOO_SMALL
+                {
                     // GetNewBufferSize
                     if cb_needed == 0 {
                         buffer_size *= 2;
@@ -271,8 +286,17 @@ impl SystemExt for System {
 
         // Parse the data block to get process information
         let mut process_ids = Vec::with_capacity(500);
-        let mut process_information_offset = 0;
+        let mut process_information_offset: isize = 0;
         loop {
+            // If this overflowed to negative something went wrong
+            assert!(process_information_offset >= 0);
+            // Bounds check for upcoming .offset(process_information_offset)
+            assert!(
+                process_information_offset as usize
+                    <= process_information.len()
+                        - std::mem::size_of::<SYSTEM_PROCESS_INFORMATION>()
+            );
+
             let p = unsafe {
                 process_information
                     .as_ptr()
@@ -291,6 +315,9 @@ impl SystemExt for System {
                 break;
             }
 
+            // Offset must never be larger than the allocated buffer
+            // If we hit this probably reading uninitialized data due to an issue earlier
+            assert!((pi.NextEntryOffset as usize) < buffer_size);
             process_information_offset += pi.NextEntryOffset as isize;
         }
         let process_list = Wrap(UnsafeCell::new(&mut self.process_list));
@@ -326,7 +353,7 @@ impl SystemExt for System {
                     // If the PID owner changed, we need to recompute the whole process.
                     sysinfo_debug!("owner changed for PID {}", proc_.pid());
                 }
-                let name = get_process_name(&pi, pid);
+                let name = get_process_name(process_information.as_ptr_range(), &pi, pid);
                 let mut p = Process::new_full(
                     pid,
                     if pi.InheritedFromUniqueProcessId as usize != 0 {
@@ -546,25 +573,31 @@ fn refresh_existing_process(
     Some(true)
 }
 
-#[allow(clippy::size_of_in_element_count)]
-//^ needed for "name.Length as usize / std::mem::size_of::<u16>()"
-pub(crate) fn get_process_name(process: &SYSTEM_PROCESS_INFORMATION, process_id: Pid) -> String {
+fn get_process_name(
+    allowed_region: Range<*const u8>,
+    process: &SYSTEM_PROCESS_INFORMATION,
+    process_id: Pid,
+) -> String {
     let name = &process.ImageName;
-    if name.Buffer.is_null() {
+    // If Buffer is null, or the string is empty, or the string length in bytes is not even
+    // then the process name is empty or invalid
+    if name.Buffer.is_null() || name.Length == 0 || name.Length % 2 == 1 {
         match process_id.0 {
             0 => "Idle".to_owned(),
             4 => "System".to_owned(),
             _ => format!("<no name> Process {process_id}"),
         }
     } else {
-        unsafe {
-            let slice = std::slice::from_raw_parts(
-                name.Buffer,
-                // The length is in bytes, not the length of string
-                name.Length as usize / std::mem::size_of::<u16>(),
-            );
+        let buffer = name.Buffer as *const u16;
+        // name.Length is in bytes, need to convert to chars (for use constructing &[u16])
+        let length_chars = name.Length as usize / std::mem::size_of::<u16>();
 
-            String::from_utf16_lossy(slice)
+        unsafe {
+            // buffer..buffer+length_chars must be within allowed_region
+            assert!(allowed_region.contains(&(buffer as *const u8)));
+            assert!(allowed_region.contains(&((buffer.add(length_chars - 1) as *const u8).add(1))));
+
+            String::from_utf16_lossy(std::slice::from_raw_parts(buffer, length_chars))
         }
     }
 }
